@@ -1,64 +1,63 @@
 import streamlit as st
-import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-import io
+from PIL import Image, ImageOps
 import numpy as np
+import base64
+import requests
+import io
 import time
 
 Image.MAX_IMAGE_PIXELS = None
 
 # ─────────────────────────────────────────────
-# 新增：图像对比度预处理
+# API 配置
+# ─────────────────────────────────────────────
+API_URL = "https://z8t5weoff78et3d2.aistudio-app.com/layout-parsing"
+TOKEN   = "d46b18fed8ee6704eacbf91c022cc549e0c7515c"
+
+HEADERS = {
+    "Authorization": f"token {TOKEN}",
+    "Content-Type":  "application/json",
+}
+
+
+# ─────────────────────────────────────────────
+# 图像预处理（保持不变）
 # ─────────────────────────────────────────────
 def preprocess_image(img, mode="extreme"):
     if mode == "off":
         return img
-
-    # 第一步：转灰度——彩色通道对 OCR 无益，统一消除
     img = img.convert("L")
-
     if mode == "standard":
-        # 自动对比度：将最暗像素映射到 0，最亮映射到 255
         return ImageOps.autocontrast(img, cutoff=0)
-
     if mode == "extreme":
-        # ① 自动对比度拉满（等价于手动拉满对比度滑块）
         img = ImageOps.autocontrast(img, cutoff=0)
-
-        # ② 用 numpy 做硬阈值二值化：低于 128 的全黑，其余全白
-        #    这是图像编辑器"对比度拉到底"后视觉效果的精确复现
         arr = np.array(img)
         arr = np.where(arr < 128, 0, 255).astype(np.uint8)
         return Image.fromarray(arr)
-
     return img
 
 
 # ─────────────────────────────────────────────
-# 核心功能：智能长图切片 (逻辑保持不变)
+# 智能长图切片（保持不变）
 # ─────────────────────────────────────────────
 def smart_slice_image(img, target_height=2500, search_window=300):
     width, height = img.size
     if height <= target_height + search_window:
         return [img]
 
-    img_gray = img.convert('L')
+    img_gray  = img.convert('L')
     img_array = np.array(img_gray)
-    chunks = []
-    current_y = 0
+    chunks, current_y = [], 0
 
     while current_y < height:
         if current_y + target_height >= height:
             chunks.append(img.crop((0, current_y, width, height)))
             break
-
-        search_start = current_y + target_height - search_window
-        search_end = current_y + target_height
-        window = img_array[search_start:search_end, :]
-        row_variances = np.var(window, axis=1)
-        best_cut_relative = np.argmin(row_variances)
-
-        cut_y = search_start + best_cut_relative
+        search_start     = current_y + target_height - search_window
+        search_end       = current_y + target_height
+        window           = img_array[search_start:search_end, :]
+        best_cut_relative = np.argmin(np.var(window, axis=1))
+        cut_y            = search_start + best_cut_relative
         chunks.append(img.crop((0, current_y, width, cut_y)))
         current_y = cut_y
 
@@ -66,7 +65,42 @@ def smart_slice_image(img, target_height=2500, search_window=300):
 
 
 # ─────────────────────────────────────────────
-# UI 全局配置与极简 CSS 注入
+# 核心：调用 PaddleOCR-VL-1.5 API
+# ─────────────────────────────────────────────
+def ocr_chunk_via_api(chunk_img: Image.Image) -> str:
+    """
+    将单块 PIL Image 编码为 base64 PNG，POST 到 VL-1.5 接口。
+    返回该块识别出的 Markdown 文本（多栏文档结构完整保留）。
+    """
+    # PIL → bytes → base64
+    buf = io.BytesIO()
+    # 若图像为灰度/二值，先转 RGB 确保 JPEG 编码兼容
+    chunk_img.convert("RGB").save(buf, format="PNG")
+    file_data = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    payload = {
+        "file":     file_data,
+        "fileType": 1,          # 1 = 图片
+        # 关闭耗时可选项，最大化速度
+        "useDocOrientationClassify": False,
+        "useDocUnwarping":           False,
+        "useChartRecognition":       False,
+    }
+
+    resp = requests.post(API_URL, json=payload, headers=HEADERS, timeout=120)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"API 返回错误 {resp.status_code}: {resp.text[:200]}")
+
+    results = resp.json().get("result", {}).get("layoutParsingResults", [])
+    # 一张图片对应一个解析结果，取第一条的 markdown 文本
+    if not results:
+        return ""
+    return results[0]["markdown"]["text"].strip()
+
+
+# ─────────────────────────────────────────────
+# UI 配置
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Vision OCR | 长图提取", layout="centered")
 
@@ -75,175 +109,130 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
-    .block-container {
-        padding-top: 3rem;
-        padding-bottom: 2rem;
-        max-width: 800px;
-    }
-    .main-title {
-        font-size: 2.2rem;
-        font-weight: 600;
-        color: #111827;
-        margin-bottom: 0.5rem;
-        letter-spacing: -0.02em;
-    }
-    .sub-title {
-        font-size: 1rem;
-        color: #6B7280;
-        margin-bottom: 2.5rem;
-        font-weight: 400;
-    }
-    .stSelectbox > div > div > div {
-        border-radius: 8px;
-        border: 1px solid #E5E7EB;
-        box-shadow: none !important;
-    }
-    .stButton > button[kind="secondary"] {
-        border-radius: 8px;
-        border: 1px solid #E5E7EB;
-        color: #374151;
-        background-color: transparent;
-        transition: all 0.2s ease;
-    }
-    .stButton > button[kind="secondary"]:hover {
-        border-color: #9CA3AF;
-        color: #111827;
-        background-color: #F9FAFB;
-    }
-    .stButton > button[kind="primary"] {
-        border-radius: 8px;
-        background-color: #111827;
-        color: #FFFFFF;
-        border: none;
-        padding: 0.5rem 1rem;
-        font-weight: 500;
-        transition: all 0.2s ease;
-    }
-    .stButton > button[kind="primary"]:hover {
-        background-color: #374151;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-    }
-    .stDownloadButton > button {
-        border-radius: 8px;
-        border: 1px solid #E5E7EB;
-        color: #111827;
-        width: 100%;
-        background-color: #FFFFFF;
-    }
-    .stDownloadButton > button:hover {
-        border-color: #9CA3AF;
-        background-color: #F9FAFB;
-    }
-    .stTextArea > div > div > textarea {
-        border-radius: 8px;
-        border: 1px solid #E5E7EB;
-        background-color: #FAFAFA;
-    }
+    .block-container { padding-top: 3rem; padding-bottom: 2rem; max-width: 800px; }
+    .main-title { font-size: 2.2rem; font-weight: 600; color: #111827; margin-bottom: 0.5rem; letter-spacing: -0.02em; }
+    .sub-title { font-size: 1rem; color: #6B7280; margin-bottom: 2.5rem; font-weight: 400; }
+    .stSelectbox > div > div > div { border-radius: 8px; border: 1px solid #E5E7EB; box-shadow: none !important; }
+    .stButton > button[kind="primary"] { border-radius: 8px; background-color: #111827; color: #FFFFFF; border: none; font-weight: 500; transition: all 0.2s ease; }
+    .stButton > button[kind="primary"]:hover { background-color: #374151; }
+    .stButton > button[kind="secondary"] { border-radius: 8px; border: 1px solid #E5E7EB; color: #374151; background-color: transparent; }
+    .stDownloadButton > button { border-radius: 8px; border: 1px solid #E5E7EB; color: #111827; width: 100%; background-color: #FFFFFF; }
+    .result-box { border: 1px solid #E5E7EB; border-radius: 8px; background: #FAFAFA; padding: 1.5rem 1.75rem; line-height: 1.8; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# 页面 Header
-# ─────────────────────────────────────────────
 st.markdown('<div class="main-title">Vision OCR.</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">针对超长图特化的极简字符提取工具，支持最高三万像素智能无损切片。</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">PaddleOCR-VL-1.5 · 版面理解 · Markdown 结构化输出</div>', unsafe_allow_html=True)
 
-# 参数映射
-LANG_MAP = {"中英混合": "chi_sim+eng", "纯中文": "chi_sim", "纯英文": "eng"}
-PSM_MAP = {"精准排版模式 (推荐)": "--psm 6", "标准模式": "--psm 3"}
-# 新增：对比度模式映射
 CONTRAST_MAP = {
-    "最高对比度 (推荐)": "extreme",
+    "不处理 (截图推荐)": "off",
     "标准增强":          "standard",
-    "不处理":            "off",
+    "最高对比度":        "extreme",
 }
 
 # ─────────────────────────────────────────────
-# 工作区：上传与设置
+# 上传与设置
 # ─────────────────────────────────────────────
 with st.container(border=True):
-    uploaded_file = st.file_uploader("选择图片文件", type=["png", "jpg", "jpeg", "webp"], label_visibility="hidden")
-
-    col_lang, col_mode, col_contrast = st.columns(3)
-    with col_lang:
-        lang_choice = st.selectbox("识别语言", ["中英混合", "纯中文", "纯英文"])
-    with col_mode:
-        mode_choice = st.selectbox("识别模式", ["精准排版模式 (推荐)", "标准模式"])
+    uploaded_file = st.file_uploader(
+        "选择图片文件", type=["png", "jpg", "jpeg", "webp"],
+        label_visibility="hidden"
+    )
+    col_contrast, col_slice = st.columns(2)
     with col_contrast:
         contrast_choice = st.selectbox("图像预处理", list(CONTRAST_MAP.keys()))
+    with col_slice:
+        slice_height = st.slider(
+            "切片高度 (px)", min_value=1000, max_value=4000, value=2500, step=500,
+            help="超长图会按此高度切片后分批发送，建议保持默认值"
+        )
 
 st.write("")
 
 # ─────────────────────────────────────────────
-# 执行操作
+# 执行识别
 # ─────────────────────────────────────────────
 if uploaded_file:
     if st.button("开始提取文本", type="primary", use_container_width=True):
         try:
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+
             img = Image.open(uploaded_file)
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            # ── 预处理阶段 ──────────────────────────
+            # 预处理
             contrast_mode = CONTRAST_MAP[contrast_choice]
             if contrast_mode != "off":
                 status_text.caption("正在增强图像对比度...")
-                # 注意：切片前先对原图预处理，保证切割逻辑仍基于原尺寸
                 img_processed = preprocess_image(img, mode=contrast_mode)
             else:
                 img_processed = img
 
-            # ── 切片阶段 ────────────────────────────
+            # 切片
             status_text.caption(f"分析图片尺寸: {img.width} × {img.height} px")
-            # 切片基于预处理后的图像；切割线的寻找逻辑同样适用于灰度/二值图
-            chunks = smart_slice_image(img_processed, target_height=2500, search_window=400)
+            chunks       = smart_slice_image(img_processed, target_height=slice_height, search_window=400)
             total_chunks = len(chunks)
 
-            config = f"--oem 3 {PSM_MAP[mode_choice]}"
-            full_text = []
+            full_md_parts = []
 
             for i, chunk in enumerate(chunks):
-                status_text.caption(f"正在处理区块 {i+1} / {total_chunks}...")
-                text = pytesseract.image_to_string(
-                    chunk,
-                    lang=LANG_MAP[lang_choice],
-                    config=config
+                status_text.caption(
+                    f"调用 VL-1.5 识别区块 {i+1} / {total_chunks}..."
+                    + (" （首块含模型冷启动，稍等）" if i == 0 else "")
                 )
-                clean_text = "\n".join([line.rstrip() for line in text.splitlines() if line.strip()])
-                if clean_text:
-                    full_text.append(clean_text)
+                md_text = ocr_chunk_via_api(chunk)
+                if md_text:
+                    full_md_parts.append(md_text)
                 progress_bar.progress((i + 1) / total_chunks)
-
-            status_text.caption("整合文本数据...")
-            time.sleep(0.3)
 
             status_text.empty()
             progress_bar.empty()
 
-            final_result = "\n\n".join(full_text)
+            final_md = "\n\n---\n\n".join(full_md_parts)  # 切片间加分割线
 
-            if not final_result.strip():
-                st.error("未能识别到有效文本，请检查图片质量或尝试更换预处理模式。")
+            if not final_md.strip():
+                st.error("未能识别到有效文本，请检查图片质量或网络连接。")
             else:
-                st.session_state['ocr_result'] = final_result
+                st.session_state['ocr_result'] = final_md
                 st.rerun()
 
+        except requests.exceptions.Timeout:
+            st.error("API 请求超时（>120s），图片可能过大，请尝试减小切片高度。")
         except Exception as e:
             st.error(f"处理异常: {e}")
 
 # ─────────────────────────────────────────────
-# 结果展示区
+# 结果展示（Markdown 渲染 + 纯文本导出）
 # ─────────────────────────────────────────────
 if 'ocr_result' in st.session_state:
     st.write("")
     st.markdown("### 提取结果")
 
-    st.text_area("Result", value=st.session_state['ocr_result'], height=400, label_visibility="hidden")
+    # Tab 1：渲染视图  Tab 2：原始 Markdown
+    tab_render, tab_raw = st.tabs(["渲染视图", "原始 Markdown"])
 
-    col_dl, col_clear = st.columns([1, 1])
-    with col_dl:
-        st.download_button("导出文本 (TXT)", st.session_state['ocr_result'], "vision_ocr_result.txt")
+    with tab_render:
+        st.markdown(
+            f'<div class="result-box">{st.session_state["ocr_result"]}</div>',
+            unsafe_allow_html=True
+        )
+    with tab_raw:
+        st.code(st.session_state['ocr_result'], language="markdown")
+
+    st.write("")
+    col_dl_md, col_dl_txt, col_clear = st.columns([1, 1, 1])
+    with col_dl_md:
+        st.download_button(
+            "导出 Markdown", st.session_state['ocr_result'],
+            "ocr_result.md", mime="text/markdown"
+        )
+    with col_dl_txt:
+        # 导出纯文本：去掉 Markdown 标记符
+        plain = "\n".join(
+            line.lstrip("#").strip()
+            for line in st.session_state['ocr_result'].splitlines()
+        )
+        st.download_button("导出纯文本 (TXT)", plain, "ocr_result.txt")
     with col_clear:
         if st.button("清除结果", type="secondary", use_container_width=True):
             del st.session_state['ocr_result']
