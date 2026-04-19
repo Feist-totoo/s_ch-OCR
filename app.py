@@ -1,6 +1,6 @@
 import streamlit as st
 import pytesseract
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import io
 import numpy as np
 import time
@@ -11,50 +11,27 @@ Image.MAX_IMAGE_PIXELS = None
 # 新增：图像对比度预处理
 # ─────────────────────────────────────────────
 def preprocess_image(img, mode="extreme"):
-    """
-    对图像进行对比度增强预处理，提升 OCR 识别准确率。
-    mode:
-      - "off"     不处理，原图直出
-      - "standard" 标准增强：灰度 + 对比度拉伸
-      - "extreme"  最高对比度：灰度 + CLAHE 模拟 + 自适应阈值二值化
-    """
     if mode == "off":
         return img
 
-    # 第一步：转为灰度
+    # 第一步：转灰度——彩色通道对 OCR 无益，统一消除
     img = img.convert("L")
 
     if mode == "standard":
-        # 使用 PIL 自带的对比度增强器，系数 2.5 是经验最优值
-        img = ImageEnhance.Contrast(img).enhance(2.5)
-        img = ImageEnhance.Sharpness(img).enhance(2.0)
-        return img
+        # 自动对比度：将最暗像素映射到 0，最亮映射到 255
+        return ImageOps.autocontrast(img, cutoff=0)
 
     if mode == "extreme":
-        arr = np.array(img, dtype=np.float32)
+        # ① 自动对比度拉满（等价于手动拉满对比度滑块）
+        img = ImageOps.autocontrast(img, cutoff=0)
 
-        # ── 直方图线性拉伸 ──────────────────────────
-        # 截断最暗 2% 和最亮 2% 的像素，避免极端噪点干扰
-        p2, p98 = np.percentile(arr, 2), np.percentile(arr, 98)
-        if p98 > p2:  # 防止除零
-            arr = np.clip((arr - p2) / (p98 - p2) * 255.0, 0, 255)
+        # ② 用 numpy 做硬阈值二值化：低于 128 的全黑，其余全白
+        #    这是图像编辑器"对比度拉到底"后视觉效果的精确复现
+        arr = np.array(img)
+        arr = np.where(arr < 128, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
 
-        # ── 自适应阈值二值化 ────────────────────────
-        # 用局部均值做自适应阈值，比全局 Otsu 对光照不均更鲁棒
-        arr_uint8 = arr.astype(np.uint8)
-        blurred = np.array(
-            Image.fromarray(arr_uint8).filter(ImageFilter.GaussianBlur(radius=15)),
-            dtype=np.float32
-        )
-        # 当像素比局部均值暗 10 以上时判定为"文字"(黑)，否则为"背景"(白)
-        binary = np.where(arr.astype(np.float32) < blurred - 10, 0, 255).astype(np.uint8)
-
-        # ── 最终锐化 ────────────────────────────────
-        result = Image.fromarray(binary)
-        result = ImageEnhance.Sharpness(result).enhance(2.0)
-        return result
-
-    return img  # 兜底返回
+    return img
 
 
 # ─────────────────────────────────────────────
