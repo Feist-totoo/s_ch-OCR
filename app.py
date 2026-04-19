@@ -1,22 +1,17 @@
 import streamlit as st
-from paddleocr import PaddleOCR
+from rapidocr import RapidOCR
 from PIL import Image, ImageOps
 import numpy as np
 import time
-import io
 
 Image.MAX_IMAGE_PIXELS = None
 
 # ─────────────────────────────────────────────
-# PaddleOCR 实例缓存（避免每次重载模型）
+# RapidOCR 实例缓存
 # ─────────────────────────────────────────────
 @st.cache_resource
-def load_ocr_engine(lang: str, use_angle_cls: bool):
-    return PaddleOCR(
-        use_angle_cls=use_angle_cls,
-        lang=lang,
-        show_log=False,
-    )
+def load_ocr_engine():
+    return RapidOCR()
 
 
 # ─────────────────────────────────────────────
@@ -72,18 +67,16 @@ def smart_slice_image(img, target_height=2500, search_window=300):
 
 
 # ─────────────────────────────────────────────
-# PaddleOCR 结果 → 纯文本（按 Y 轴排序）
+# RapidOCR 结果 → 纯文本（按 Y 轴排序）
 # ─────────────────────────────────────────────
-def paddle_result_to_text(result, conf_threshold=0.5):
-    if not result or not result[0]:
+def result_to_text(result, conf_threshold=0.5):
+    if not result or not result.boxes:
         return ""
 
     lines = []
-    for item in result[0]:
-        box, (text, conf) = item
-        if conf >= conf_threshold:
-            # 取文字框顶部中点 Y 坐标用于排序
-            top_y = (box[0][1] + box[1][1]) / 2
+    for box, text, score in zip(result.boxes, result.txts, result.scores):
+        if score >= conf_threshold:
+            top_y = box[0][1]
             lines.append((top_y, text))
 
     lines.sort(key=lambda x: x[0])
@@ -171,23 +164,18 @@ st.markdown("""
 # 页面 Header
 # ─────────────────────────────────────────────
 st.markdown('<div class="main-title">Vision OCR.</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">针对超长图特化的极简字符提取工具，由 PaddleOCR 驱动，支持最高三万像素智能无损切片。</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">针对超长图特化的极简字符提取工具，由 RapidOCR 驱动，支持最高三万像素智能无损切片。</div>', unsafe_allow_html=True)
 
 # 参数映射
-LANG_MAP = {
-    "中英混合": "ch",
-    "纯中文":   "ch",
-    "纯英文":   "en",
-}
 CONTRAST_MAP = {
     "最高对比度 (推荐)": "extreme",
-    "标准增强":          "standard",
-    "不处理":            "off",
+    "标准增强":           "standard",
+    "不处理":             "off",
 }
 CONF_MAP = {
-    "严格 (≥ 0.8)":  0.8,
-    "标准 (≥ 0.5)":  0.5,
-    "宽松 (≥ 0.3)":  0.3,
+    "严格 (≥ 0.8)": 0.8,
+    "标准 (≥ 0.5)": 0.5,
+    "宽松 (≥ 0.3)": 0.3,
 }
 
 # ─────────────────────────────────────────────
@@ -200,15 +188,13 @@ with st.container(border=True):
         label_visibility="hidden",
     )
 
-    col_lang, col_contrast, col_conf = st.columns(3)
-    with col_lang:
-        lang_choice     = st.selectbox("识别语言",   list(LANG_MAP.keys()))
+    col_contrast, col_conf, col_cls = st.columns(3)
     with col_contrast:
         contrast_choice = st.selectbox("图像预处理", list(CONTRAST_MAP.keys()))
     with col_conf:
-        conf_choice     = st.selectbox("置信度阈值", list(CONF_MAP.keys()), index=1)
-
-    angle_cls = st.toggle("自动纠正文字方向（旋转图适用）", value=False)
+        conf_choice = st.selectbox("置信度阈值", list(CONF_MAP.keys()), index=1)
+    with col_cls:
+        angle_cls = st.toggle("自动纠正方向", value=False, help="适用于拍照倾斜或旋转的图片")
 
 st.write("")
 
@@ -224,25 +210,21 @@ if uploaded_file:
             status_text  = st.empty()
 
             # ── 加载引擎 ────────────────────────────
-            status_text.caption("加载 PaddleOCR 模型（首次运行需下载，请稍候）...")
-            ocr = load_ocr_engine(
-                lang=LANG_MAP[lang_choice],
-                use_angle_cls=angle_cls,
-            )
+            status_text.caption("加载 RapidOCR 模型（首次运行需下载，请稍候）...")
+            ocr = load_ocr_engine()
 
             # ── 预处理 ──────────────────────────────
             contrast_mode = CONTRAST_MAP[contrast_choice]
             if contrast_mode != "off":
                 status_text.caption("正在增强图像对比度...")
                 img_processed = preprocess_image(img, mode=contrast_mode)
-                # PaddleOCR 需要 RGB；灰度 / 二值图转回三通道
                 img_processed = img_processed.convert("RGB")
             else:
                 img_processed = img
 
             # ── 切片 ────────────────────────────────
             status_text.caption(f"分析图片尺寸：{img.width} × {img.height} px")
-            chunks      = smart_slice_image(img_processed, target_height=2500, search_window=400)
+            chunks       = smart_slice_image(img_processed, target_height=2500, search_window=400)
             total_chunks = len(chunks)
 
             conf_threshold = CONF_MAP[conf_choice]
@@ -250,9 +232,14 @@ if uploaded_file:
 
             for i, chunk in enumerate(chunks):
                 status_text.caption(f"正在识别区块 {i+1} / {total_chunks}...")
-                chunk_array = np.array(chunk)          # PaddleOCR 接受 ndarray
-                result      = ocr.ocr(chunk_array, cls=angle_cls)
-                text        = paddle_result_to_text(result, conf_threshold=conf_threshold)
+                chunk_array = np.array(chunk)
+                result = ocr(
+                    chunk_array,
+                    use_cls=angle_cls,
+                    use_det=True,
+                    use_rec=True,
+                )
+                text = result_to_text(result, conf_threshold=conf_threshold)
                 if text.strip():
                     full_text.append(text.strip())
                 progress_bar.progress((i + 1) / total_chunks)
