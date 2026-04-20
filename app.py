@@ -70,18 +70,24 @@ def smart_slice_image(img, target_height=2500, search_window=300):
 # RapidOCR 结果 → 纯文本（按 Y 轴排序）
 # ─────────────────────────────────────────────
 def result_to_text(result, conf_threshold=0.5):
-    if not result or not result.boxes:
+    if result is None:
+        return ""
+
+    boxes  = result.boxes
+    txts   = result.txts
+    scores = result.scores
+
+    if boxes is None or txts is None or scores is None:
         return ""
 
     lines = []
-    for box, text, score in zip(result.boxes, result.txts, result.scores):
-        if score >= conf_threshold:
-            top_y = box[0][1]
+    for box, text, score in zip(boxes, txts, scores):
+        if score is not None and score >= conf_threshold:
+            top_y = float(box[0][1])
             lines.append((top_y, text))
 
     lines.sort(key=lambda x: x[0])
     return "\n".join(t for _, t in lines)
-
 
 # ─────────────────────────────────────────────
 # UI 配置与 CSS
