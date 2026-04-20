@@ -3,4 +3,4 @@ rapidocr
 Pillow
 numpy
 opencv-python-headless
-onnxruntime
+rapidocr_onnxruntime
