@@ -2,3 +2,4 @@ streamlit
 rapidocr
 Pillow
 numpy
+opencv-python-headless
